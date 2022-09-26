@@ -1,7 +1,10 @@
 #include "stdafx.h"
 #include "Calibration.h"
+#include "CalibrationMetrics.h"
 #include "Configuration.h"
 #include "IPCClient.h"
+#include "CalibrationCalc.h"
+#include "VRState.h"
 
 #include <string>
 #include <vector>
@@ -9,255 +12,205 @@
 
 #include <Eigen/Dense>
 
+inline vr::HmdQuaternion_t operator*(const vr::HmdQuaternion_t& lhs, const vr::HmdQuaternion_t& rhs) {
+	return {
+		(lhs.w * rhs.w) - (lhs.x * rhs.x) - (lhs.y * rhs.y) - (lhs.z * rhs.z),
+		(lhs.w * rhs.x) + (lhs.x * rhs.w) + (lhs.y * rhs.z) - (lhs.z * rhs.y),
+		(lhs.w * rhs.y) + (lhs.y * rhs.w) + (lhs.z * rhs.x) - (lhs.x * rhs.z),
+		(lhs.w * rhs.z) + (lhs.z * rhs.w) + (lhs.x * rhs.y) - (lhs.y * rhs.x)
+	};
+}
 
-static IPCClient Driver;
 CalibrationContext CalCtx;
+IPCClient Driver;
+static protocol::DriverPoseShmem shmem;
+
+namespace {
+	CalibrationCalc calibration;
+
+	inline vr::HmdVector3d_t quaternionRotateVector(const vr::HmdQuaternion_t& quat, const double(&vector)[3]) {
+		vr::HmdQuaternion_t vectorQuat = { 0.0, vector[0], vector[1] , vector[2] };
+		vr::HmdQuaternion_t conjugate = { quat.w, -quat.x, -quat.y, -quat.z };
+		auto rotatedVectorQuat = quat * vectorQuat * conjugate;
+		return { rotatedVectorQuat.x, rotatedVectorQuat.y, rotatedVectorQuat.z };
+	}
+
+	inline Eigen::Matrix3d quaternionRotateMatrix(const vr::HmdQuaternion_t& quat) {
+		return Eigen::Quaterniond(quat.w, quat.x, quat.y, quat.z).toRotationMatrix();
+	}
+
+	struct DSample
+	{
+		bool valid;
+		Eigen::Vector3d ref, target;
+	};
+
+	bool StartsWith(const std::string& str, const std::string& prefix)
+	{
+		if (str.length() < prefix.length())
+			return false;
+
+		return str.compare(0, prefix.length(), prefix) == 0;
+	}
+
+	bool EndsWith(const std::string& str, const std::string& suffix)
+	{
+		if (str.length() < suffix.length())
+			return false;
+
+		return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
+	}
+
+	Eigen::Vector3d AxisFromRotationMatrix3(Eigen::Matrix3d rot)
+	{
+		return Eigen::Vector3d(rot(2, 1) - rot(1, 2), rot(0, 2) - rot(2, 0), rot(1, 0) - rot(0, 1));
+	}
+
+	double AngleFromRotationMatrix3(Eigen::Matrix3d rot)
+	{
+		return acos((rot(0, 0) + rot(1, 1) + rot(2, 2) - 1.0) / 2.0);
+	}
+
+	vr::HmdQuaternion_t VRRotationQuat(const Eigen::Quaterniond& rotQuat)
+	{
+
+		vr::HmdQuaternion_t vrRotQuat;
+		vrRotQuat.x = rotQuat.coeffs()[0];
+		vrRotQuat.y = rotQuat.coeffs()[1];
+		vrRotQuat.z = rotQuat.coeffs()[2];
+		vrRotQuat.w = rotQuat.coeffs()[3];
+		return vrRotQuat;
+	}
+	
+	vr::HmdQuaternion_t VRRotationQuat(Eigen::Vector3d eulerdeg)
+	{
+		auto euler = eulerdeg * EIGEN_PI / 180.0;
+
+		Eigen::Quaterniond rotQuat =
+			Eigen::AngleAxisd(euler(0), Eigen::Vector3d::UnitZ()) *
+			Eigen::AngleAxisd(euler(1), Eigen::Vector3d::UnitY()) *
+			Eigen::AngleAxisd(euler(2), Eigen::Vector3d::UnitX());
+
+		return VRRotationQuat(rotQuat);
+	}
+
+	vr::HmdVector3d_t VRTranslationVec(Eigen::Vector3d transcm)
+	{
+		auto trans = transcm * 0.01;
+		vr::HmdVector3d_t vrTrans;
+		vrTrans.v[0] = trans[0];
+		vrTrans.v[1] = trans[1];
+		vrTrans.v[2] = trans[2];
+		return vrTrans;
+	}
+
+	DSample DeltaRotationSamples(Sample s1, Sample s2)
+	{
+		// Difference in rotation between samples.
+		auto dref = s1.ref.rot * s2.ref.rot.transpose();
+		auto dtarget = s1.target.rot * s2.target.rot.transpose();
+
+		// When stuck together, the two tracked objects rotate as a pair,
+		// therefore their axes of rotation must be equal between any given pair of samples.
+		DSample ds;
+		ds.ref = AxisFromRotationMatrix3(dref);
+		ds.target = AxisFromRotationMatrix3(dtarget);
+
+		// Reject samples that were too close to each other.
+		auto refA = AngleFromRotationMatrix3(dref);
+		auto targetA = AngleFromRotationMatrix3(dtarget);
+		ds.valid = refA > 0.4 && targetA > 0.4 && ds.ref.norm() > 0.01 && ds.target.norm() > 0.01;
+
+		ds.ref.normalize();
+		ds.target.normalize();
+		return ds;
+	}
+
+	Pose ConvertPose(const vr::DriverPose_t &driverPose) {
+		Eigen::Quaterniond driverToWorldQ(
+			driverPose.qWorldFromDriverRotation.w,
+			driverPose.qWorldFromDriverRotation.x,
+			driverPose.qWorldFromDriverRotation.y,
+			driverPose.qWorldFromDriverRotation.z
+		);
+		Eigen::Vector3d driverToWorldV(
+			driverPose.vecWorldFromDriverTranslation[0],
+			driverPose.vecWorldFromDriverTranslation[1],
+			driverPose.vecWorldFromDriverTranslation[2]
+		);
+
+		Eigen::Quaterniond driverRot = driverToWorldQ * Eigen::Quaterniond(
+			driverPose.qRotation.w,
+			driverPose.qRotation.x,
+			driverPose.qRotation.y,
+			driverPose.qRotation.z
+		);
+		
+		Eigen::Vector3d driverPos = driverToWorldV + driverToWorldQ * Eigen::Vector3d(
+			driverPose.vecPosition[0],
+			driverPose.vecPosition[1],
+			driverPose.vecPosition[2]
+		);
+
+		Eigen::AffineCompact3d xform = Eigen::Translation3d(driverPos) * driverRot;
+
+		return Pose(xform);
+	}
+
+	bool CollectSample(const CalibrationContext& ctx)
+	{
+		vr::DriverPose_t reference, target;
+		reference.poseIsValid = false;
+		target.poseIsValid = false;
+
+		reference = ctx.devicePoses[ctx.referenceID];
+		target = ctx.devicePoses[ctx.targetID];
+
+		bool ok = true;
+		if (!reference.poseIsValid)
+		{
+			CalCtx.Log("Reference device is not tracking\n"); ok = false;
+		}
+		if (!target.poseIsValid)
+		{
+			CalCtx.Log("Target device is not tracking\n"); ok = false;
+		}
+		if (!ok)
+		{
+			if (CalCtx.state != CalibrationState::Continuous) {
+				CalCtx.Log("Aborting calibration!\n");
+				CalCtx.state = CalibrationState::None;
+			}
+			return false;
+		}
+
+		calibration.PushSample(Sample(
+			ConvertPose(reference),
+			ConvertPose(target)
+		));
+
+		return true;
+	}
+
+	bool AssignTargets() {
+		auto state = VRState::Load();
+		
+		if (CalCtx.referenceID < 0) {
+			CalCtx.referenceID = state.FindDevice(CalCtx.referenceStandby.trackingSystem, CalCtx.referenceStandby.model, CalCtx.referenceStandby.serial);
+		}
+
+		if (CalCtx.targetID < 0) {
+			CalCtx.targetID = state.FindDevice(CalCtx.targetStandby.trackingSystem, CalCtx.targetStandby.model, CalCtx.targetStandby.serial);
+		}
+
+		return CalCtx.referenceID >= 0 && CalCtx.targetID >= 0;
+	}
+}
 
 void InitCalibrator()
 {
 	Driver.Connect();
-}
-
-struct Pose
-{
-	Eigen::Matrix3d rot;
-	Eigen::Vector3d trans;
-
-	Pose() { }
-	Pose(vr::HmdMatrix34_t hmdMatrix)
-	{
-		for (int i = 0; i < 3; i++) {
-			for (int j = 0; j < 3; j++) {
-				rot(i,j) = hmdMatrix.m[i][j];
-			}
-		}
-		trans = Eigen::Vector3d(hmdMatrix.m[0][3], hmdMatrix.m[1][3], hmdMatrix.m[2][3]);
-	}
-	Pose(double x, double y, double z) : trans(Eigen::Vector3d(x,y,z)) { }
-};
-
-struct Sample
-{
-	Pose ref, target;
-	bool valid;
-	Sample() : valid(false) { }
-	Sample(Pose ref, Pose target) : valid(true), ref(ref), target(target) { }
-};
-
-struct DSample
-{
-	bool valid;
-	Eigen::Vector3d ref, target;
-};
-
-bool StartsWith(const std::string &str, const std::string &prefix)
-{
-	if (str.length() < prefix.length())
-		return false;
-
-	return str.compare(0, prefix.length(), prefix) == 0;
-}
-
-bool EndsWith(const std::string &str, const std::string &suffix)
-{
-	if (str.length() < suffix.length())
-		return false;
-
-	return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
-}
-
-Eigen::Vector3d AxisFromRotationMatrix3(Eigen::Matrix3d rot)
-{
-	return Eigen::Vector3d(rot(2,1) - rot(1,2), rot(0,2) - rot(2,0), rot(1,0) - rot(0,1));
-}
-
-double AngleFromRotationMatrix3(Eigen::Matrix3d rot)
-{
-	return acos((rot(0,0) + rot(1,1) + rot(2,2) - 1.0) / 2.0);
-}
-
-DSample DeltaRotationSamples(Sample s1, Sample s2)
-{
-	// Difference in rotation between samples.
-	auto dref = s1.ref.rot * s2.ref.rot.transpose();
-	auto dtarget = s1.target.rot * s2.target.rot.transpose();
-
-	// When stuck together, the two tracked objects rotate as a pair,
-	// therefore their axes of rotation must be equal between any given pair of samples.
-	DSample ds;
-	ds.ref = AxisFromRotationMatrix3(dref);
-	ds.target = AxisFromRotationMatrix3(dtarget);
-
-	// Reject samples that were too close to each other.
-	auto refA = AngleFromRotationMatrix3(dref);
-	auto targetA = AngleFromRotationMatrix3(dtarget);
-	ds.valid = refA > 0.4 && targetA > 0.4 && ds.ref.norm() > 0.01 && ds.target.norm() > 0.01;
-
-	ds.ref.normalize();
-	ds.target.normalize();
-	return ds;
-}
-
-Eigen::Vector3d CalibrateRotation(const std::vector<Sample> &samples)
-{
-	std::vector<DSample> deltas;
-
-	for (size_t i = 0; i < samples.size(); i++)
-	{
-		for (size_t j = 0; j < i; j++)
-		{
-			auto delta = DeltaRotationSamples(samples[i], samples[j]);
-			if (delta.valid)
-				deltas.push_back(delta);
-		}
-	}
-	char buf[256];
-	snprintf(buf, sizeof buf, "Got %zd samples with %zd delta samples\n", samples.size(), deltas.size());
-	CalCtx.Log(buf);
-
-	// Kabsch algorithm
-
-	Eigen::MatrixXd refPoints(deltas.size(), 3), targetPoints(deltas.size(), 3);
-	Eigen::Vector3d refCentroid(0,0,0), targetCentroid(0,0,0);
-
-	for (size_t i = 0; i < deltas.size(); i++)
-	{
-		refPoints.row(i) = deltas[i].ref;
-		refCentroid += deltas[i].ref;
-
-		targetPoints.row(i) = deltas[i].target;
-		targetCentroid += deltas[i].target;
-	}
-
-	refCentroid /= (double) deltas.size();
-	targetCentroid /= (double) deltas.size();
-
-	for (size_t i = 0; i < deltas.size(); i++)
-	{
-		refPoints.row(i) -= refCentroid;
-		targetPoints.row(i) -= targetCentroid;
-	}
-
-	auto crossCV = refPoints.transpose() * targetPoints;
-
-	Eigen::BDCSVD<Eigen::MatrixXd> bdcsvd;
-	auto svd = bdcsvd.compute(crossCV, Eigen::ComputeThinU | Eigen::ComputeThinV);
-
-	Eigen::Matrix3d i = Eigen::Matrix3d::Identity();
-	if ((svd.matrixU() * svd.matrixV().transpose()).determinant() < 0)
-	{
-		i(2,2) = -1;
-	}
-
-	Eigen::Matrix3d rot = svd.matrixV() * i * svd.matrixU().transpose();
-	rot.transposeInPlace();
-
-	Eigen::Vector3d euler = rot.eulerAngles(2, 1, 0) * 180.0 / EIGEN_PI;
-
-	snprintf(buf, sizeof buf, "Calibrated rotation: yaw=%.2f pitch=%.2f roll=%.2f\n", euler[1], euler[2], euler[0]);
-	CalCtx.Log(buf);
-	return euler;
-}
-
-Eigen::Vector3d CalibrateTranslation(const std::vector<Sample> &samples)
-{
-	std::vector<std::pair<Eigen::Vector3d, Eigen::Matrix3d>> deltas;
-
-	for (size_t i = 0; i < samples.size(); i++)
-	{
-		for (size_t j = 0; j < i; j++)
-		{
-			auto QAi = samples[i].ref.rot.transpose();
-			auto QAj = samples[j].ref.rot.transpose();
-			auto dQA = QAj - QAi;
-			auto CA = QAj * (samples[j].ref.trans - samples[j].target.trans) - QAi * (samples[i].ref.trans - samples[i].target.trans);
-			deltas.push_back(std::make_pair(CA, dQA));
-
-			auto QBi = samples[i].target.rot.transpose();
-			auto QBj = samples[j].target.rot.transpose();
-			auto dQB = QBj - QBi;
-			auto CB = QBj * (samples[j].ref.trans - samples[j].target.trans) - QBi * (samples[i].ref.trans - samples[i].target.trans);
-			deltas.push_back(std::make_pair(CB, dQB));
-		}
-	}
-
-	Eigen::VectorXd constants(deltas.size() * 3);
-	Eigen::MatrixXd coefficients(deltas.size() * 3, 3);
-
-	for (size_t i = 0; i < deltas.size(); i++)
-	{
-		for (int axis = 0; axis < 3; axis++)
-		{
-			constants(i * 3 + axis) = deltas[i].first(axis);
-			coefficients.row(i * 3 + axis) = deltas[i].second.row(axis);
-		}
-	}
-
-	Eigen::Vector3d trans = coefficients.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(constants);
-	auto transcm = trans * 100.0;
-
-	char buf[256];
-	snprintf(buf, sizeof buf, "Calibrated translation x=%.2f y=%.2f z=%.2f\n", transcm[0], transcm[1], transcm[2]);
-	CalCtx.Log(buf);
-	return transcm;
-}
-
-Sample CollectSample(const CalibrationContext &ctx)
-{
-	vr::TrackedDevicePose_t reference, target;
-	reference.bPoseIsValid = false;
-	target.bPoseIsValid = false;
-
-	reference = ctx.devicePoses[ctx.referenceID];
-	target = ctx.devicePoses[ctx.targetID];
-
-	bool ok = true;
-	if (!reference.bPoseIsValid)
-	{
-		CalCtx.Log("Reference device is not tracking\n"); ok = false;
-	}
-	if (!target.bPoseIsValid)
-	{
-		CalCtx.Log("Target device is not tracking\n"); ok = false;
-	}
-	if (!ok)
-	{
-		CalCtx.Log("Aborting calibration!\n");
-		CalCtx.state = CalibrationState::None;
-		return Sample();
-	}
-
-	return Sample(
-		Pose(reference.mDeviceToAbsoluteTracking),
-		Pose(target.mDeviceToAbsoluteTracking)
-	);
-}
-
-vr::HmdQuaternion_t VRRotationQuat(Eigen::Vector3d eulerdeg)
-{
-	auto euler = eulerdeg * EIGEN_PI / 180.0;
-
-	Eigen::Quaterniond rotQuat =
-		Eigen::AngleAxisd(euler(0), Eigen::Vector3d::UnitZ()) *
-		Eigen::AngleAxisd(euler(1), Eigen::Vector3d::UnitY()) *
-		Eigen::AngleAxisd(euler(2), Eigen::Vector3d::UnitX());
-
-	vr::HmdQuaternion_t vrRotQuat;
-	vrRotQuat.x = rotQuat.coeffs()[0];
-	vrRotQuat.y = rotQuat.coeffs()[1];
-	vrRotQuat.z = rotQuat.coeffs()[2];
-	vrRotQuat.w = rotQuat.coeffs()[3];
-	return vrRotQuat;
-}
-
-vr::HmdVector3d_t VRTranslationVec(Eigen::Vector3d transcm)
-{
-	auto trans = transcm * 0.01;
-	vr::HmdVector3d_t vrTrans;
-	vrTrans.v[0] = trans[0];
-	vrTrans.v[1] = trans[1];
-	vrTrans.v[2] = trans[2];
-	return vrTrans;
+	shmem.Open(OPENVR_SPACECALIBRATOR_SHMEM_NAME);
 }
 
 void ResetAndDisableOffsets(uint32_t id)
@@ -277,8 +230,14 @@ static_assert(vr::k_unTrackedDeviceIndex_Hmd == 0, "HMD index expected to be 0")
 
 void ScanAndApplyProfile(CalibrationContext &ctx)
 {
-	char buffer[vr::k_unMaxPropertyStringSize];
+	std::unique_ptr<char[]> buffer_array(new char
+[vr::k_unMaxPropertyStringSize]);
+	char* buffer = buffer_array.get();
 	ctx.enabled = ctx.validProfile;
+
+	protocol::Request setParamsReq(protocol::RequestSetAlignmentSpeedParams);
+	setParamsReq.setAlignmentSpeedParams = ctx.alignmentSpeedParams;
+	Driver.SendBlocking(setParamsReq);
 
 	for (uint32_t id = 0; id < vr::k_unMaxTrackedDeviceCount; ++id)
 	{
@@ -341,6 +300,9 @@ void ScanAndApplyProfile(CalibrationContext &ctx)
 			VRRotationQuat(ctx.calibratedRotation),
 			ctx.calibratedScale
 		};
+		req.setDeviceTransform.lerp = CalCtx.state == CalibrationState::Continuous;
+		req.setDeviceTransform.quash = CalCtx.state == CalibrationState::Continuous && id == CalCtx.targetID && CalCtx.quashTargetInContinuous;
+
 		Driver.SendBlocking(req);
 	}
 
@@ -363,6 +325,22 @@ void StartCalibration()
 	CalCtx.state = CalibrationState::Begin;
 	CalCtx.wantedUpdateInterval = 0.0;
 	CalCtx.messages.clear();
+	calibration.Clear();
+	Metrics::WriteLogAnnotation("StartCalibration");
+}
+
+void StartContinuousCalibration() {
+	CalCtx.calibrationSpeed = CalibrationContext::FAST;
+	StartCalibration();
+	CalCtx.state = CalibrationState::Continuous;
+	CalCtx.Log("Collecting initial samples...");
+	Metrics::WriteLogAnnotation("StartContinuousCalibration");
+}
+
+void EndContinuousCalibration() {
+	CalCtx.state = CalibrationState::None;
+	SaveProfile(CalCtx);
+	Metrics::WriteLogAnnotation("EndContinuousCalibration");
 }
 
 void CalibrationTick(double time)
@@ -374,18 +352,40 @@ void CalibrationTick(double time)
 	if ((time - ctx.timeLastTick) < 0.05)
 		return;
 
+	if (ctx.state == CalibrationState::Continuous || ctx.state == CalibrationState::ContinuousStandby) {
+		ctx.ClearLogOnMessage();
+	}
+
 	ctx.timeLastTick = time;
-	vr::VRSystem()->GetDeviceToAbsoluteTrackingPose(vr::TrackingUniverseRawAndUncalibrated, 0.0f, ctx.devicePoses, vr::k_unMaxTrackedDeviceCount);
+	shmem.ReadNewPoses([&](const protocol::DriverPoseShmem::AugmentedPose& augmented_pose) {
+		if (augmented_pose.deviceId >= 0 && augmented_pose.deviceId <= vr::k_unMaxTrackedDeviceCount) {
+			ctx.devicePoses[augmented_pose.deviceId] = augmented_pose.pose;
+		}
+	});
 
-	if (ctx.state == CalibrationState::None)
+	if (ctx.state == CalibrationState::None || ctx.state == CalibrationState::ContinuousStandby
+		|| (ctx.state == CalibrationState::Continuous && !calibration.isValid()))
 	{
-		ctx.wantedUpdateInterval = 1.0;
-
 		if ((time - ctx.timeLastScan) >= 1.0)
 		{
 			ScanAndApplyProfile(ctx);
 			ctx.timeLastScan = time;
 		}
+	}
+
+	if (ctx.state == CalibrationState::ContinuousStandby) {
+		if (AssignTargets()) {
+			StartContinuousCalibration();
+		}
+		else {
+			ctx.wantedUpdateInterval = 0.5;
+			ctx.Log("Waiting for devices...");
+			return;
+		}
+	}
+
+	if (ctx.state == CalibrationState::None) {
+		ctx.wantedUpdateInterval = 1.0;
 		return;
 	}
 
@@ -401,11 +401,23 @@ void CalibrationTick(double time)
 		return;
 	}
 
+	bool ok = true;
+
+	if (ctx.referenceID == -1 || ctx.referenceID >= vr::k_unMaxTrackedDeviceCount) {
+		CalCtx.Log("Missing reference device\n");
+		ok = false;
+	}
+	if (ctx.targetID == -1 || ctx.targetID >= vr::k_unMaxTrackedDeviceCount)
+	{
+		CalCtx.Log("Missing target device\n");
+		ok = false;
+	}
+
 	if (ctx.state == CalibrationState::Begin)
 	{
-		bool ok = true;
 
 		char referenceSerial[256], targetSerial[256];
+		referenceSerial[0] = targetSerial[0] = 0;
 		vr::VRSystem()->GetStringTrackedDeviceProperty(ctx.referenceID, vr::Prop_SerialNumber_String, referenceSerial, 256);
 		vr::VRSystem()->GetStringTrackedDeviceProperty(ctx.targetID, vr::Prop_SerialNumber_String, targetSerial, 256);
 
@@ -415,83 +427,99 @@ void CalibrationTick(double time)
 		snprintf(buf, sizeof buf, "Target device ID: %d, serial %s\n", ctx.targetID, targetSerial);
 		CalCtx.Log(buf);
 
-		if (ctx.referenceID == -1)
-		{
-			CalCtx.Log("Missing reference device\n"); ok = false;
-		}
-		else if (!ctx.devicePoses[ctx.referenceID].bPoseIsValid)
+		ScanAndApplyProfile(ctx);
+
+		if (!CalCtx.ReferencePoseIsValid())
 		{
 			CalCtx.Log("Reference device is not tracking\n"); ok = false;
 		}
 
-		if (ctx.targetID == -1)
-		{
-			CalCtx.Log("Missing target device\n"); ok = false;
-		}
-		else if (!ctx.devicePoses[ctx.targetID].bPoseIsValid)
+		if (!CalCtx.TargetPoseIsValid())
 		{
 			CalCtx.Log("Target device is not tracking\n"); ok = false;
 		}
 
-		if (!ok)
-		{
-			ctx.state = CalibrationState::None;
-			CalCtx.Log("Aborting calibration!\n");
+		if (ok) {
+			//ResetAndDisableOffsets(ctx.targetID);
+			ctx.state = CalibrationState::Rotation;
+			ctx.wantedUpdateInterval = 0.0;
+
+			CalCtx.Log("Starting calibration...\n");
 			return;
 		}
-
-		ResetAndDisableOffsets(ctx.targetID);
-		ctx.state = CalibrationState::Rotation;
-		ctx.wantedUpdateInterval = 0.0;
-
-		CalCtx.Log("Starting calibration...\n");
-		return;
 	}
 
-	auto sample = CollectSample(ctx);
-	if (!sample.valid)
+	if (!ok)
 	{
-		return;
-	}
+		if (ctx.state != CalibrationState::Continuous) {
+			ctx.state = CalibrationState::None;
 
-	static std::vector<Sample> samples;
-	samples.push_back(sample);
-
-	CalCtx.Progress(samples.size(), CalCtx.SampleCount());
-
-	if (samples.size() == CalCtx.SampleCount())
-	{
-		CalCtx.Log("\n");
-		if (ctx.state == CalibrationState::Rotation)
-		{
-			ctx.calibratedRotation = CalibrateRotation(samples);
-
-			auto vrRotQuat = VRRotationQuat(ctx.calibratedRotation);
-
-			protocol::Request req(protocol::RequestSetDeviceTransform);
-			req.setDeviceTransform = { ctx.targetID, true, vrRotQuat };
-			Driver.SendBlocking(req);
-
-			ctx.state = CalibrationState::Translation;
+			CalCtx.Log("Aborting calibration!\n");
 		}
-		else if (ctx.state == CalibrationState::Translation)
-		{
-			ctx.calibratedTranslation = CalibrateTranslation(samples);
+		return;
+	}
+
+	if (!CollectSample(ctx))
+	{
+		return;
+	}
+
+	CalCtx.Progress(calibration.SampleCount(), (int)CalCtx.SampleCount());
+
+	while (calibration.SampleCount() > CalCtx.SampleCount()) calibration.ShiftSample();
+
+	if (calibration.SampleCount() >= CalCtx.SampleCount())
+	{
+		LARGE_INTEGER start_time;
+		QueryPerformanceCounter(&start_time);
+		
+		bool ok, lerp = false;
+
+		if (CalCtx.state == CalibrationState::Continuous) {
+			CalCtx.messages.clear();
+			calibration.enableStaticRecalibration = CalCtx.enableStaticRecalibration;
+			ok = calibration.ComputeIncremental(lerp, CalCtx.continuousCalibrationThreshold);
+		}
+		else {
+			calibration.enableStaticRecalibration = false;
+			ok = calibration.ComputeOneshot();
+		}
+
+		if (calibration.isValid()) {
+			ctx.calibratedRotation = calibration.EulerRotation();
+			ctx.calibratedTranslation = calibration.Transformation().translation() * 100.0; // convert to cm units for profile storage
 
 			auto vrTrans = VRTranslationVec(ctx.calibratedTranslation);
-
-			protocol::Request req(protocol::RequestSetDeviceTransform);
-			req.setDeviceTransform = { ctx.targetID, true, vrTrans };
-			Driver.SendBlocking(req);
+			auto vrRot = VRRotationQuat(Eigen::Quaterniond(calibration.Transformation().rotation()));
 
 			ctx.validProfile = true;
 			SaveProfile(ctx);
-			CalCtx.Log("Finished calibration, profile saved\n");
 
-			ctx.state = CalibrationState::None;
+			ScanAndApplyProfile(ctx);
+
+			CalCtx.Log("Finished calibration, profile saved\n");
+		}
+		else
+		{
+			CalCtx.Log("Calibration failed.\n");
 		}
 
-		samples.clear();
+		LARGE_INTEGER end_time;
+		QueryPerformanceCounter(&end_time);
+		LARGE_INTEGER freq;
+		QueryPerformanceFrequency(&freq);
+		double duration = (end_time.QuadPart - start_time.QuadPart) / (double)freq.QuadPart;
+		Metrics::computationTime.Push(duration * 1000.0);
+
+		Metrics::WriteLogEntry();
+		
+		if (CalCtx.state != CalibrationState::Continuous) {
+			ctx.state = CalibrationState::None;
+			calibration.Clear();
+		}
+		else {
+			for (int i = 0; i < 10; i++) calibration.ShiftSample();
+		}
 	}
 }
 
@@ -512,8 +540,13 @@ void LoadChaperoneBounds()
 void ApplyChaperoneBounds()
 {
 	vr::VRChaperoneSetup()->RevertWorkingCopy();
-	vr::VRChaperoneSetup()->SetWorkingCollisionBoundsInfo(&CalCtx.chaperone.geometry[0], CalCtx.chaperone.geometry.size());
+	vr::VRChaperoneSetup()->SetWorkingCollisionBoundsInfo(&CalCtx.chaperone.geometry[0], (uint32_t)CalCtx.chaperone.geometry.size());
 	vr::VRChaperoneSetup()->SetWorkingStandingZeroPoseToRawTrackingPose(&CalCtx.chaperone.standingCenter);
 	vr::VRChaperoneSetup()->SetWorkingPlayAreaSize(CalCtx.chaperone.playSpaceSize.v[0], CalCtx.chaperone.playSpaceSize.v[1]);
 	vr::VRChaperoneSetup()->CommitWorkingCopy(vr::EChaperoneConfigFile_Live);
+}
+
+void DebugApplyRandomOffset() {
+	protocol::Request req(protocol::RequestDebugOffset);
+	Driver.SendBlocking(req);
 }
