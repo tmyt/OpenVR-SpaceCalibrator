@@ -206,6 +206,9 @@ void ServerTrackedDeviceProvider::SetDeviceTransform(const protocol::SetDeviceTr
 
 bool ServerTrackedDeviceProvider::HandleDevicePoseUpdated(uint32_t openVRID, vr::DriverPose_t &pose)
 {
+	// Ensure openVRID is within the valid range of 0 to 63.
+	if (openVRID < 0 || openVRID > 63) return true;
+
 	// Apply debug pose before anything else
 	if (openVRID > 0) {
 		auto dbgPos = convert(pose.vecPosition) + debugTransform;
